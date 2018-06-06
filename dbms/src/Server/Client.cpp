@@ -38,6 +38,7 @@
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <DataStreams/AsynchronousBlockInputStream.h>
+#include <DataStreams/SystemLogsRowOutputStream.h>
 #include <Parsers/ParserQuery.h>
 #include <Parsers/ASTSetQuery.h>
 #include <Parsers/ASTUseQuery.h>
@@ -131,10 +132,12 @@ private:
 
     /// Console output.
     WriteBufferFromFileDescriptor std_out {STDOUT_FILENO};
+    WriteBufferFromFileDescriptor std_err {STDERR_FILENO};
     std::unique_ptr<ShellCommand> pager_cmd;
     /// The user can specify to redirect query output to a file.
     std::optional<WriteBufferFromFile> out_file_buf;
     BlockOutputStreamPtr block_out_stream;
+    BlockOutputStreamPtr logs_out_stream;
 
     String home_path;
 
@@ -353,6 +356,8 @@ private:
 
         std::cout << std::fixed << std::setprecision(3);
         std::cerr << std::fixed << std::setprecision(3);
+
+        Logger::root().setLevel("trace");
 
         if (is_interactive)
             showClientVersion();
@@ -963,18 +968,23 @@ private:
     void resetOutput()
     {
         block_out_stream = nullptr;
+        logs_out_stream = nullptr;
+
         if (pager_cmd)
         {
             pager_cmd->in.close();
             pager_cmd->wait();
         }
         pager_cmd = nullptr;
+
         if (out_file_buf)
         {
             out_file_buf->next();
             out_file_buf.reset();
         }
+
         std_out.next();
+        std_err.next();
     }
 
 
@@ -1047,6 +1057,10 @@ private:
                 onException(*packet.exception);
                 last_exception = std::move(packet.exception);
                 return false;
+
+            case Protocol::Server::Log:
+                onLogData(packet.block);
+                return true;
 
             case Protocol::Server::EndOfStream:
                 onEndOfStream();
@@ -1132,10 +1146,22 @@ private:
     }
 
 
+    void initLogsOutputStream()
+    {
+        if (!logs_out_stream)
+        {
+            logs_out_stream = SystemLogsRowOutputStream::create(std_err);
+            logs_out_stream->writePrefix();
+        }
+    }
+
+
     void onData(Block & block)
     {
         if (written_progress_chars)
             clearProgress();
+
+        std::cerr << "onData: " << block.rows() << " " << block.columns() << "\n";
 
         if (!block)
             return;
@@ -1152,6 +1178,17 @@ private:
 
         /// Received data block is immediately displayed to the user.
         block_out_stream->flush();
+    }
+
+
+    void onLogData(Block & block)
+    {
+        initLogsOutputStream();
+
+        std::cerr << "onLogData: " << block.rows() << " " << block.columns() << "\n";
+
+        logs_out_stream->write(block);
+        logs_out_stream->flush();
     }
 
 
@@ -1306,6 +1343,9 @@ private:
     {
         if (block_out_stream)
             block_out_stream->writeSuffix();
+
+        if (logs_out_stream)
+            logs_out_stream->writeSuffix();
 
         resetOutput();
 

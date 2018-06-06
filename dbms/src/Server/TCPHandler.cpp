@@ -29,6 +29,8 @@
 #include <Common/ExternalTable.h>
 
 #include "TCPHandler.h"
+#include <Server/ClickHouseLogChannel.h>
+#include <Core/SystemLogsQueue.h>
 
 #include <Common/NetException.h>
 #include <ext/scope_guard.h>
@@ -151,6 +153,13 @@ void TCPHandler::runImpl()
                 continue;
 
             CurrentThread::initializeQuery();
+
+            /// Should we send internal logs to client?
+            if (!query_context.getSettingsRef().servers_logs_level.value.empty())
+            {
+                state.logs_queue = std::make_shared<SystemLogsQueue>();
+                CurrentThread::attachSystemLogsQueue(state.logs_queue);
+            }
 
             query_context.setExternalTablesInitializer([&global_settings, this] (Context & context) {
                 if (&context != &query_context)
@@ -329,6 +338,8 @@ void TCPHandler::processInsertQuery(const Settings & global_settings)
 
 void TCPHandler::processOrdinaryQuery()
 {
+    Block block;
+
     /// Pull query execution result, if exists, and send it to network.
     if (state.io.in)
     {
@@ -344,8 +355,6 @@ void TCPHandler::processOrdinaryQuery()
 
         while (true)
         {
-            Block block;
-
             while (true)
             {
                 if (isQueryCancelled())
@@ -362,6 +371,9 @@ void TCPHandler::processOrdinaryQuery()
                         after_send_progress.restart();
                         sendProgress();
                     }
+
+                    if (state.logs_queue)
+                        sendLogs();
 
                     if (async_in.poll(query_context.getSettingsRef().interactive_delay / 1000))
                     {
@@ -385,17 +397,26 @@ void TCPHandler::processOrdinaryQuery()
                 sendExtremes();
                 sendProfileInfo();
                 sendProgress();
+                if (state.logs_queue)
+                    sendLogs();
             }
 
-            sendData(block);
             if (!block)
                 break;
+
+            sendData(block);
         }
 
         async_in.readSuffix();
     }
 
     state.io.onFinish();
+
+    if (state.logs_queue)
+        sendLogs();
+
+    if (!block)
+        sendData(block);
 }
 
 
@@ -708,16 +729,38 @@ void TCPHandler::initBlockOutput(const Block & block)
 {
     if (!state.block_out)
     {
-        if (state.compression == Protocol::Compression::Enable)
-            state.maybe_compressed_out = std::make_shared<CompressedWriteBuffer>(
-                *out, CompressionSettings(query_context.getSettingsRef()));
-        else
-            state.maybe_compressed_out = out;
+        initOutputBuffers();
 
         state.block_out = std::make_shared<NativeBlockOutputStream>(
             *state.maybe_compressed_out,
             client_revision,
             block.cloneEmpty());
+    }
+}
+
+void TCPHandler::initLogsBlockOutput(const Block & block)
+{
+    if (!state.logs_block_out)
+    {
+        initOutputBuffers();
+
+        state.logs_block_out = std::make_shared<NativeBlockOutputStream>(
+            *state.maybe_compressed_out,
+            client_revision,
+            block.cloneEmpty());
+    }
+}
+
+
+void TCPHandler::initOutputBuffers()
+{
+    if (!state.maybe_compressed_out)
+    {
+        if (state.compression == Protocol::Compression::Enable)
+            state.maybe_compressed_out = std::make_shared<CompressedWriteBuffer>(
+                *out, CompressionSettings(query_context.getSettingsRef()));
+        else
+            state.maybe_compressed_out = out;
     }
 }
 
@@ -761,9 +804,24 @@ void TCPHandler::sendData(const Block & block)
     initBlockOutput(block);
 
     writeVarUInt(Protocol::Server::Data, *out);
+    /// Send external table name (empty name is the main table)
     writeStringBinary("", *out);
 
     state.block_out->write(block);
+    state.maybe_compressed_out->next();
+    out->next();
+}
+
+
+void TCPHandler::sendLogData(const Block & block)
+{
+    initLogsBlockOutput(block);
+
+    writeVarUInt(Protocol::Server::Log, *out);
+    /// Send log tag (empty tag is the default tag)
+    writeStringBinary("", *out);
+
+    state.logs_block_out->write(block);
     state.maybe_compressed_out->next();
     out->next();
 }
@@ -797,6 +855,38 @@ void TCPHandler::sendProgress()
     auto increment = state.progress.fetchAndResetPiecewiseAtomically();
     increment.write(*out, client_revision);
     out->next();
+}
+
+
+void TCPHandler::sendLogs()
+{
+    MutableColumns logs_columns;
+    MutableColumns curr_logs_columns;
+    size_t rows = 0;
+
+    for (; state.logs_queue->tryPop(curr_logs_columns); ++rows)
+    {
+        if (rows == 0)
+        {
+            logs_columns = std::move(curr_logs_columns);
+        }
+        else
+        {
+            for (size_t j = 0; j < logs_columns.size(); ++j)
+                logs_columns[j]->insertRangeFrom(*curr_logs_columns[j], 0, curr_logs_columns[j]->size());
+        }
+    }
+
+    if (rows > 0)
+    {
+        Block block = SystemLogsQueue::getSampleBlock();
+        block.setColumns(std::move(logs_columns));
+        block.checkNumberOfRows();
+
+        std::cerr << "sendLogs: " << block.rows() << " " << block.columns() << "\n";
+
+        sendLogData(block);
+    }
 }
 
 

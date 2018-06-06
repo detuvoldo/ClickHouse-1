@@ -489,12 +489,13 @@ bool Connection::hasReadBufferPendingData() const
 
 Connection::Packet Connection::receivePacket()
 {
-    //LOG_TRACE(log_wrapper.get(), "Receiving packet");
+    LOG_TRACE(log_wrapper.get(), "Receiving packet");
 
     try
     {
         Packet res;
         readVarUInt(res.type, *in);
+        LOG_INFO(log_wrapper.get(), "Receiving packet " << res.type << " " << Protocol::Server::toString(res.type));
 
         switch (res.type)
         {
@@ -521,6 +522,10 @@ Connection::Packet Connection::receivePacket()
 
             case Protocol::Server::Extremes:
                 /// Same as above.
+                res.block = receiveData();
+                return res;
+
+            case Protocol::Server::Log:
                 res.block = receiveData();
                 return res;
 
